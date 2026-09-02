@@ -1,24 +1,26 @@
 # tailnet-speedtest
 
-在 tailnet 内网中，用浏览器测量本机到服务器的链路质量：**下行/上行带宽、延迟（RTT）、抖动、双向丢包率估计**，并显示该连接走的是 **direct 直连还是 DERP 中继**（通过本机 `tailscale status` 获取，取不到则不显示）。
+在 tailnet 内网中，用浏览器测量任意设备到服务器的链路质量：**下行/上行带宽（单流 + 4 并发）、空闲与负载下延迟（RTT）、抖动、下行 TCP 重传率**，并显示连接走的是 **direct 直连还是 DERP 中继**。所有结果存服务端 SQLite，任何设备打开都能看到全量历史与趋势。
 
-单个 Go 二进制，前端页面用 `embed` 内嵌，无任何运行时依赖。
+单个 Go 二进制，前端页面用 `embed` 内嵌，SQLite 用纯 Go 驱动（modernc.org/sqlite），无 CGO、无运行时依赖。
 
 ## 测量原理
 
 | 指标 | 方法 |
 |---|---|
-| 延迟 / 抖动 | WebSocket 回显 100 个带序号的消息（10ms 间隔），客户端计算 RTT，抖动按 RFC 3550 递推 |
-| 丢包 | 上行：服务端比对收到的序号；下行：客户端统计未回显的序号。基于 TCP 上的 WS，测的是应用层消息丢失，长时间为 0 属正常 |
-| 下行带宽 | `GET /api/download?size=N` 流式下发随机数据；先用 8MB 探测约 1s 估算带宽，再按目标 8s 选定正式数据量，XHR progress 采样画实时曲线，统计时丢弃前 15%（TCP 慢启动） |
-| 上行带宽 | 4MB Blob 分块 POST 到 `/api/upload`，服务端读尽即弃；同样先探测再定块数 |
+| 空闲延迟 / 抖动 | WebSocket 回显 100 个消息（10ms 间隔），RTT 取 avg/min/max，抖动按 RFC 3550 递推 |
+| 负载下延迟 | WS 连接在整个测试期间保活，带宽测试阶段每 250ms 继续 ping——暴露中继链路的 bufferbloat |
+| 下行/上行带宽 | 单流与 4 并发各测一次（目标时长 8s，先探测估算带宽再定数据量）；统计丢弃前 15% 样本（TCP 慢启动）。单流与多流差距大说明单连接受 TCP 窗口限制 |
+| 下行 TCP 重传 | 服务端在下载连接上 `getsockopt(TCP_INFO)` 读取该连接重传段数（Linux）。上行方向的重传发生在客户端 TCP 栈，服务端读不到，故只报下行 |
+| direct / relay | 服务端执行 `tailscale status --json` 匹配客户端 tailnet IP |
+
+不提供"丢包率"数字：TCP/WS 之上的丢包统计会被重传掩盖，是误导性指标；链路丢包以重传率 + 负载延迟尖峰呈现。
 
 ## 使用
 
 ```bash
-# 直接跑
 go build -o tailnet-speedtest .
-./tailnet-speedtest -addr :8080
+./tailnet-speedtest -addr :8080 -db speedtest.db
 # 浏览器打开 http://<服务器 tailnet IP>:8080
 ```
 
@@ -29,16 +31,23 @@ go build -o tailnet-speedtest .
 ./install.sh -addr 100.x.y.z:8080   # 只绑 tailnet 接口 IP
 ```
 
-`install.sh` 会优先使用项目内 `.toolchain/go`（若存在），否则用系统 `go`。service 默认以 root 运行，以便读 `tailscaled` socket 获取 direct/relay 信息；不需要该信息可自行把 unit 改成 `DynamicUser=yes`。
+`install.sh` 会优先使用项目内 `.toolchain/go`（若存在），否则用系统 `go`。service 以 root 运行（需读 `tailscaled` socket 获取 whois 身份与 direct/relay 信息），数据库放在 `/var/lib/tailnet-speedtest/`（`StateDirectory`）。
+
+## 防护
+
+- 全局同时只允许 1 个测试（并行测试互相污染带宽数字）
+- 每客户端 IP 每分钟最多 3 次测试，超限返回 429
+- `-max-download` 单次下载上限默认 512MB
 
 ## 参数
 
 - `-addr`：监听地址，默认 `:8080`
-- `-max-download`：单次下载请求的字节上限，默认 512MB
+- `-db`：SQLite 路径，默认 `./speedtest.db`
+- `-max-download`：单次下载请求字节上限，默认 512MB
 
 ## HTTPS（可选）
 
-纯 HTTP 在 tailnet 内已加密（WireGuard），一般够用。想要浏览器绿锁可用 `tailscale serve`：
+纯 HTTP 在 tailnet 内已由 WireGuard 加密，一般够用。想要浏览器绿锁可用 `tailscale serve`：
 
 ```bash
 tailscale serve --bg 8080   # 然后访问 https://<机器名>.<tailnet>.ts.net
@@ -46,8 +55,11 @@ tailscale serve --bg 8080   # 然后访问 https://<机器名>.<tailnet>.ts.net
 
 ## 文件
 
-- `main.go` — 入口、路由
-- `server.go` — download/upload/info 端点
-- `ws.go` — WebSocket 延迟/抖动/丢包测量
-- `static/index.html` — 前端单页（内联 JS/CSS，embed 进二进制）
+- `main.go` — 入口、路由、ConnContext（暴露连接给 TCP_INFO）
+- `server.go` — download/upload/results/limiter/info 端点
+- `ws.go` — WebSocket 延迟回显（跨测试阶段保活）
+- `db.go` — SQLite 存储
+- `ratelimit.go` — 全局并发与每 IP 限流
+- `tailscale.go` — whois 身份归属、direct/relay 查询
+- `static/index.html` — 前端单页（测速 + 历史趋势两个 tab，embed 进二进制）
 - `tailnet-speedtest.service`、`install.sh` — systemd 部署
