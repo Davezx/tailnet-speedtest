@@ -4,3 +4,6 @@ speedtest.jsonl
 *.jsonl
 *.db
 server.log
+run.log
+run.pid
+HERMES.md

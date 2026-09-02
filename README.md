@@ -20,11 +20,11 @@
 
 ```bash
 go build -o tailnet-speedtest .
-./tailnet-speedtest -addr :8080 -db speedtest.db
-# 浏览器打开 http://<服务器 tailnet IP>:8080
+nohup ./tailnet-speedtest -addr <tailnet-IP>:8081 -db speedtest.jsonl > run.log 2>&1 & echo $! > run.pid
+# 浏览器打开 http://<tailnet-IP>:8081；用完 kill $(cat run.pid)
 ```
 
-## 部署（systemd）
+## 部署（systemd，可选常驻）
 
 ```bash
 ./install.sh            # 编译 → /usr/local/bin → systemd enable --now，监听 :8080
