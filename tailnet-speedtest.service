@@ -7,7 +7,7 @@ Wants=network-online.target
 # Runs as root so it can read /run/tailscale/tailscaled.sock for whois
 # identity attribution and direct-vs-relay info. Drop the tailscale
 # integration and use DynamicUser=yes if you don't want that.
-ExecStart=/usr/local/bin/tailnet-speedtest -addr :8080 -db /var/lib/tailnet-speedtest/speedtest.db
+ExecStart=/usr/local/bin/tailnet-speedtest -addr :8080 -db /var/lib/tailnet-speedtest/speedtest.jsonl
 StateDirectory=tailnet-speedtest
 Restart=on-failure
 RestartSec=2

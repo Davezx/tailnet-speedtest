@@ -1,8 +1,8 @@
 # tailnet-speedtest
 
-在 tailnet 内网中，用浏览器测量任意设备到服务器的链路质量：**下行/上行带宽（单流 + 4 并发）、空闲与负载下延迟（RTT）、抖动、下行 TCP 重传率**，并显示连接走的是 **direct 直连还是 DERP 中继**。所有结果存服务端 SQLite，任何设备打开都能看到全量历史与趋势。
+在 tailnet 内网中，用浏览器测量任意设备到服务器的链路质量：**下行/上行带宽（单流 + 4 并发）、空闲与负载下延迟（RTT）、抖动、下行 TCP 重传率**，并显示连接走的是 **direct 直连还是 DERP 中继**。所有结果以 JSONL 追加存服务端文件，任何设备打开都能看到全量历史与趋势。
 
-单个 Go 二进制，前端页面用 `embed` 内嵌，SQLite 用纯 Go 驱动（modernc.org/sqlite），无 CGO、无运行时依赖。
+单个 Go 二进制，前端页面用 `embed` 内嵌，存储为零依赖的 JSON Lines 文件（数据量极小，无需数据库），无 CGO、无运行时依赖。
 
 ## 测量原理
 
@@ -42,7 +42,7 @@ go build -o tailnet-speedtest .
 ## 参数
 
 - `-addr`：监听地址，默认 `:8080`
-- `-db`：SQLite 路径，默认 `./speedtest.db`
+- `-db`：结果存储路径（JSON Lines），默认 `./speedtest.jsonl`
 - `-max-download`：单次下载请求字节上限，默认 512MB
 
 ## HTTPS（可选）
@@ -58,7 +58,7 @@ tailscale serve --bg 8080   # 然后访问 https://<机器名>.<tailnet>.ts.net
 - `main.go` — 入口、路由、ConnContext（暴露连接给 TCP_INFO）
 - `server.go` — download/upload/results/limiter/info 端点
 - `ws.go` — WebSocket 延迟回显（跨测试阶段保活）
-- `db.go` — SQLite 存储
+- `db.go` — JSONL 结果存储
 - `ratelimit.go` — 全局并发与每 IP 限流
 - `tailscale.go` — whois 身份归属、direct/relay 查询
 - `static/index.html` — 前端单页（测速 + 历史趋势两个 tab，embed 进二进制）

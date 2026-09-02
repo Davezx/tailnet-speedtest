@@ -1,5 +1,6 @@
 .toolchain/
 tailnet-speedtest
-speedtest.db
+speedtest.jsonl
+*.jsonl
 *.db
 server.log

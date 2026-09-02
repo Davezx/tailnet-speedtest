@@ -1,11 +1,11 @@
 package main
 
 import (
-	"database/sql"
-	"fmt"
+	"bufio"
+	"encoding/json"
+	"os"
+	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Result is one completed speed test. Metrics come from the browser;
@@ -25,92 +25,128 @@ type Result struct {
 	RTTIdleMax   float64   `json:"rttIdleMax"`
 	RTTLoadedAvg float64   `json:"rttLoadedAvg"`
 	Jitter       float64   `json:"jitter"`
-	Retrans      int64     `json:"retrans"`  // downlink retransmitted TCP segments
+	Retrans      int64     `json:"retrans"`    // downlink retransmitted TCP segments
 	RetransPct   float64   `json:"retransPct"` // retrans / total downlink segments
 	Direct       *bool     `json:"direct,omitempty"`
 	Relay        string    `json:"relay,omitempty"`
 }
 
+// store keeps results as JSON Lines on disk plus an in-memory index.
+// Volume is tiny (a manual test produces <1KB), so a full-file rewrite for
+// note edits is fine and no database dependency is needed.
 type store struct {
-	db *sql.DB
+	path string
+	mu   sync.Mutex
+	rows []Result
 }
 
 func openStore(path string) (*store, error) {
-	db, err := sql.Open("sqlite", path)
+	s := &store{path: path}
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return s, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS results (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		ts DATETIME NOT NULL,
-		identity TEXT NOT NULL DEFAULT '',
-		client_ip TEXT NOT NULL DEFAULT '',
-		note TEXT NOT NULL DEFAULT '',
-		down_single REAL, down_multi REAL, up_single REAL, up_multi REAL,
-		rtt_idle_avg REAL, rtt_idle_min REAL, rtt_idle_max REAL, rtt_loaded_avg REAL,
-		jitter REAL, retrans INTEGER, retrans_pct REAL,
-		direct INTEGER, relay TEXT NOT NULL DEFAULT ''
-	)`)
-	if err != nil {
-		return nil, fmt.Errorf("create table: %w", err)
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	var maxID int64
+	for sc.Scan() {
+		var r Result
+		if json.Unmarshal(sc.Bytes(), &r) == nil && r.ID > 0 {
+			s.rows = append(s.rows, r)
+			if r.ID > maxID {
+				maxID = r.ID
+			}
+		}
 	}
-	return &store{db: db}, nil
+	return s, sc.Err()
 }
 
 func (s *store) insert(r *Result) error {
-	var direct any
-	if r.Direct != nil {
-		direct = *r.Direct
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var maxID int64
+	for _, row := range s.rows {
+		if row.ID > maxID {
+			maxID = row.ID
+		}
 	}
-	res, err := s.db.Exec(`INSERT INTO results
-		(ts, identity, client_ip, note, down_single, down_multi, up_single, up_multi,
-		 rtt_idle_avg, rtt_idle_min, rtt_idle_max, rtt_loaded_avg, jitter,
-		 retrans, retrans_pct, direct, relay)
-		VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TS, r.Identity, r.ClientIP, r.DownSingle, r.DownMulti, r.UpSingle, r.UpMulti,
-		r.RTTIdleAvg, r.RTTIdleMin, r.RTTIdleMax, r.RTTLoadedAvg, r.Jitter,
-		r.Retrans, r.RetransPct, direct, r.Relay)
+	r.ID = maxID + 1
+	line, err := json.Marshal(r)
 	if err != nil {
 		return err
 	}
-	r.ID, _ = res.LastInsertId()
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	s.rows = append(s.rows, *r)
 	return nil
 }
 
+// list returns newest-first results, capped at limit.
 func (s *store) list(limit int) ([]Result, error) {
-	rows, err := s.db.Query(`SELECT id, ts, identity, client_ip, note,
-		down_single, down_multi, up_single, up_multi,
-		rtt_idle_avg, rtt_idle_min, rtt_idle_max, rtt_loaded_avg, jitter,
-		retrans, retrans_pct, direct, relay
-		FROM results ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := []Result{}
-	for rows.Next() {
-		var r Result
-		var direct sql.NullBool
-		err := rows.Scan(&r.ID, &r.TS, &r.Identity, &r.ClientIP, &r.Note,
-			&r.DownSingle, &r.DownMulti, &r.UpSingle, &r.UpMulti,
-			&r.RTTIdleAvg, &r.RTTIdleMin, &r.RTTIdleMax, &r.RTTLoadedAvg, &r.Jitter,
-			&r.Retrans, &r.RetransPct, &direct, &r.Relay)
-		if err != nil {
-			return nil, err
-		}
-		if direct.Valid {
-			b := direct.Bool
-			r.Direct = &b
-		}
-		out = append(out, r)
+	for i := len(s.rows) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, s.rows[i])
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *store) setNote(id int64, note string) error {
 	if len(note) > 200 {
 		note = note[:200]
 	}
-	_, err := s.db.Exec(`UPDATE results SET note = ? WHERE id = ?`, note, id)
-	return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].Note = note
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	// rewrite whole file; tiny data set
+	tmp := s.path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	for _, row := range s.rows {
+		line, err := json.Marshal(row)
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		w.Write(line)
+		w.WriteByte('\n')
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }

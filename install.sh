@@ -14,6 +14,15 @@ if [ -x .toolchain/go/bin/go ]; then
 fi
 command -v go >/dev/null || { echo "go toolchain not found (expected .toolchain/go or system go)"; exit 1; }
 
+# Build guard: this is a small-memory shared server. Refuse to build when
+# free memory is low, and compile single-threaded to cap peak usage.
+AVAIL_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+if [ "${AVAIL_MB:-0}" -lt 1200 ]; then
+  echo "aborting: only ${AVAIL_MB}MB memory available (<1200MB). Stop heavy services or build elsewhere."
+  exit 1
+fi
+export GOFLAGS="-p=1 ${GOFLAGS:-}"   # single-threaded compile: slower but small peak RSS
+
 go build -trimpath -o tailnet-speedtest .
 
 sudo install -m 0755 tailnet-speedtest /usr/local/bin/tailnet-speedtest

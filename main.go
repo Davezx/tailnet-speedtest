@@ -20,7 +20,7 @@ var staticFS embed.FS
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	maxDownload := flag.Int64("max-download", 512<<20, "max bytes allowed per download request")
-	dbPath := flag.String("db", "speedtest.db", "SQLite database path")
+	dbPath := flag.String("db", "speedtest.jsonl", "results storage path (JSON Lines)")
 	flag.Parse()
 
 	st, err := openStore(*dbPath)
