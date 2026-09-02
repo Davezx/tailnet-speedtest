@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tailnet Speedtest</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0f1420; color: #dde3ee; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .meta { color: #8b94a7; font-size: .85rem; margin-bottom: 20px; }
+  .meta code { color: #9ecbff; }
+  #start { font-size: 1.1rem; padding: 12px 32px; border: 0; border-radius: 8px;
+           background: #2f7cf6; color: #fff; cursor: pointer; }
+  #start:disabled { background: #33405a; cursor: default; }
+  #phase { margin: 14px 0 6px; color: #9ecbff; min-height: 1.2em; font-size: .95rem; }
+  canvas { width: 100%; height: 180px; background: #131a2a; border-radius: 8px; display: block; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 10px; margin-top: 18px; }
+  .card { background: #131a2a; border-radius: 8px; padding: 12px 14px; }
+  .card .label { color: #8b94a7; font-size: .78rem; }
+  .card .value { font-size: 1.45rem; font-weight: 600; margin-top: 4px; }
+  .card .unit { font-size: .8rem; color: #8b94a7; font-weight: 400; }
+  .good { color: #4ade80; } .warn { color: #fbbf24; } .bad { color: #f87171; }
+  h2 { font-size: 1rem; margin: 28px 0 8px; color: #9ecbff; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid #1f2940; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: #8b94a7; font-weight: 500; }
+  #err { color: #f87171; margin-top: 10px; min-height: 1.2em; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tailnet Speedtest</h1>
+  <div class="meta" id="meta">正在获取连接信息…</div>
+  <button id="start">开始测试</button>
+  <div id="phase"></div>
+  <canvas id="chart" width="720" height="180"></canvas>
+  <div class="grid" id="results" hidden>
+    <div class="card"><div class="label">下行</div><div class="value" id="r-down">–</div></div>
+    <div class="card"><div class="label">上行</div><div class="value" id="r-up">–</div></div>
+    <div class="card"><div class="label">延迟 (avg/min/max)</div><div class="value" id="r-rtt">–</div></div>
+    <div class="card"><div class="label">抖动</div><div class="value" id="r-jitter">–</div></div>
+    <div class="card"><div class="label">丢包（上行/下行）</div><div class="value" id="r-loss">–</div></div>
+  </div>
+  <div id="err"></div>
+  <h2>历史记录（本机保存）</h2>
+  <table id="history">
+    <thead><tr><th>时间</th><th>下行</th><th>上行</th><th>延迟</th><th>抖动</th><th>丢包↑/↓</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const PING_COUNT = 100, PING_INTERVAL_MS = 10;
+const DOWNLOAD_TARGET_S = 8, UPLOAD_TARGET_S = 8;
+const UPLOAD_CHUNK = 4 << 20;
+
+const fmtMbps = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
+const lossClass = p => p > 2 ? "bad" : p > 0.2 ? "warn" : "good";
+
+// ---- connection info -------------------------------------------------------
+fetch("/api/info").then(r => r.json()).then(info => {
+  let ts = "";
+  if (info.tailscale) {
+    const path = info.tailscale.direct ? "直连 direct" : `经 DERP 中继 (${info.tailscale.relay || "?"})`;
+    ts = ` · 对端 <code>${info.tailscale.peerName || "?"}</code> · ${path}`;
+  }
+  $("meta").innerHTML =
+    `客户端 <code>${info.clientIP}</code>${ts} · 服务器时间 ${new Date(info.serverTime).toLocaleString()}`;
+}).catch(() => { $("meta").textContent = "连接信息获取失败"; });
+
+// ---- chart -----------------------------------------------------------------
+const ctx = $("chart").getContext("2d");
+let samples = []; // Mbps samples for the current phase
+
+function drawChart() {
+  const {width: w, height: h} = $("chart");
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#8b94a7"; ctx.font = "12px system-ui";
+  if (samples.length < 2) {
+    ctx.fillText(samples.length ? "" : "速率曲线", 12, 20);
+    return;
+  }
+  const max = Math.max(...samples) * 1.15 || 1;
+  ctx.strokeStyle = "#1f2940";
+  for (let i = 1; i <= 3; i++) {
+    const y = h - h * i / 4;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.fillText((max * i / 4).toFixed(0) + " Mbps", 8, y - 4);
+  }
+  ctx.strokeStyle = "#2f7cf6"; ctx.lineWidth = 2; ctx.beginPath();
+  samples.forEach((v, i) => {
+    const x = i / (samples.length - 1) * w, y = h - v / max * h;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke(); ctx.lineWidth = 1;
+}
+
+// ---- latency / jitter / loss over WebSocket --------------------------------
+function testLatency() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    const sent = new Map();  // seq -> send time
+    const rtts = [];
+    let gotResult = false, timer;
+    const fail = m => { if (!gotResult) { gotResult = true; clearTimeout(timer); ws.close(); reject(new Error(m)); } };
+    timer = setTimeout(() => fail("延迟测试超时"), 30000);
+
+    ws.onopen = () => {
+      for (let i = 0; i < PING_COUNT; i++) {
+        setTimeout(() => {
+          if (ws.readyState === 1) { sent.set(i, performance.now()); ws.send(JSON.stringify({type: "ping", seq: i, ts: Date.now()})); }
+        }, i * PING_INTERVAL_MS);
+      }
+      setTimeout(() => { // allow stragglers, then ask server for uplink stats
+        if (ws.readyState === 1) ws.send(JSON.stringify({type: "done", sent: PING_COUNT}));
+      }, PING_COUNT * PING_INTERVAL_MS + 2000);
+    };
+    ws.onmessage = ev => {
+      const m = JSON.parse(ev.data);
+      if (m.seq !== undefined && sent.has(m.seq)) {
+        rtts.push(performance.now() - sent.get(m.seq));
+      } else if (m.type === "result" && !gotResult) {
+        gotResult = true; clearTimeout(timer); ws.close();
+        const avg = rtts.reduce((a, b) => a + b, 0) / (rtts.length || 1);
+        let jitter = 0;
+        for (let i = 1; i < rtts.length; i++) jitter += (Math.abs(rtts[i] - rtts[i - 1]) - jitter) / 16; // RFC 3550
+        resolve({
+          avg, min: Math.min(...rtts), max: Math.max(...rtts), jitter,
+          downLoss: (PING_COUNT - rtts.length) / PING_COUNT * 100,
+          upLoss: (PING_COUNT - m.received) / PING_COUNT * 100,
+        });
+      }
+    };
+    ws.onerror = () => fail("WebSocket 连接失败");
+    ws.onclose = () => fail("WebSocket 提前关闭");
+  });
+}
+
+// ---- throughput helpers ----------------------------------------------------
+// XHR progress → Mbps samples; returns overall Mbps computed after trimming
+// the first 15% (TCP slow start).
+function xfer(url, method, bodies, onSample) {
+  return new Promise((resolve, reject) => {
+    const marks = []; // {t, bytes}
+    let done = 0, prevBytes = 0, prevT = performance.now();
+    const note = loaded => {
+      const t = performance.now(), bytes = done + loaded;
+      if (t - prevT >= 200) {
+        onSample(8 * (bytes - prevBytes) / (t - prevT) / 1000);
+        marks.push({t, bytes}); prevBytes = bytes; prevT = t;
+      }
+    };
+    const next = i => {
+      if (i >= bodies.length) {
+        if (marks.length < 3) return reject(new Error("样本太少，链路可能极慢"));
+        const start = marks[Math.floor(marks.length * 0.15)], end = marks[marks.length - 1];
+        return resolve(8 * (end.bytes - start.bytes) / (end.t - start.t) / 1000);
+      }
+      const x = new XMLHttpRequest();
+      x.open(method, url);
+      x.responseType = method === "GET" ? "blob" : "json";
+      (method === "GET" ? x : x.upload).onprogress = e => note(e.loaded);
+      x.onload = () => {
+        if (x.status >= 400) return reject(new Error(`${method} ${url} → HTTP ${x.status}`));
+        done += method === "GET" ? x.response.size : (x.response.received || 0);
+        note(0); next(i + 1);
+      };
+      x.onerror = () => reject(new Error(`${method} ${url} 网络错误`));
+      x.send(method === "GET" ? null : bodies[i]);
+    };
+    next(0);
+  });
+}
+
+const speedOf = (bytes, ms) => 8 * bytes / ms / 1000; // Mbps
+
+async function testDownload() {
+  // probe ~1 s to pick a size that lands near DOWNLOAD_TARGET_S
+  let t0 = performance.now();
+  await xfer(`/api/download?size=${8 << 20}&probe=1`, "GET", [null], () => {});
+  const probeMbps = Math.max(speedOf(8 << 20, performance.now() - t0), 0.5);
+  const size = Math.min(Math.max(Math.round(probeMbps / 8 * 1e6 * DOWNLOAD_TARGET_S), 16 << 20), 256 << 20);
+  return xfer(`/api/download?size=${size}`, "GET", [null], v => { samples.push(v); drawChart(); });
+}
+
+async function testUpload() {
+  const blob = new Blob([new Uint8Array(UPLOAD_CHUNK)]);
+  let t0 = performance.now();
+  await xfer("/api/upload", "POST", [blob], () => {});
+  const probeMbps = Math.max(speedOf(UPLOAD_CHUNK, performance.now() - t0), 0.5);
+  const chunks = Math.min(Math.max(Math.round(probeMbps / 8 * 1e6 * UPLOAD_TARGET_S / UPLOAD_CHUNK), 2), 32);
+  return xfer("/api/upload", "POST", Array(chunks).fill(blob), v => { samples.push(v); drawChart(); });
+}
+
+// ---- orchestration ---------------------------------------------------------
+async function run() {
+  const btn = $("start");
+  btn.disabled = true; $("err").textContent = "";
+  const setPhase = t => { $("phase").textContent = t; samples = []; drawChart(); };
+  try {
+    setPhase("① 延迟 / 抖动 / 丢包…");
+    const lat = await testLatency();
+    setPhase("② 下行带宽…");
+    const down = await testDownload();
+    setPhase("③ 上行带宽…");
+    const up = await testUpload();
+    setPhase("完成");
+
+    $("results").hidden = false;
+    $("r-down").innerHTML = `${fmtMbps(down)} <span class="unit">Mbps</span>`;
+    $("r-up").innerHTML = `${fmtMbps(up)} <span class="unit">Mbps</span>`;
+    $("r-rtt").innerHTML = `${lat.avg.toFixed(1)}<span class="unit"> / ${lat.min.toFixed(1)} / ${lat.max.toFixed(1)} ms</span>`;
+    $("r-jitter").innerHTML = `${lat.jitter.toFixed(2)} <span class="unit">ms</span>`;
+    $("r-loss").innerHTML =
+      `<span class="${lossClass(lat.upLoss)}">${lat.upLoss.toFixed(1)}%</span><span class="unit"> / </span>` +
+      `<span class="${lossClass(lat.downLoss)}">${lat.downLoss.toFixed(1)}%</span>`;
+
+    saveHistory({time: new Date().toLocaleString(), down, up, lat});
+  } catch (e) {
+    setPhase(""); $("err").textContent = "测试失败：" + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---- history ---------------------------------------------------------------
+const HKEY = "tailnet-speedtest-history";
+function saveHistory(r) {
+  const h = JSON.parse(localStorage.getItem(HKEY) || "[]");
+  h.unshift(r); localStorage.setItem(HKEY, JSON.stringify(h.slice(0, 20)));
+  renderHistory();
+}
+function renderHistory() {
+  const h = JSON.parse(localStorage.getItem(HKEY) || "[]");
+  $("history").querySelector("tbody").innerHTML = h.map(r =>
+    `<tr><td>${r.time}</td><td>${fmtMbps(r.down)}</td><td>${fmtMbps(r.up)}</td>` +
+    `<td>${r.lat.avg.toFixed(1)} ms</td><td>${r.lat.jitter.toFixed(2)} ms</td>` +
+    `<td>${r.lat.upLoss.toFixed(1)}% / ${r.lat.downLoss.toFixed(1)}%</td></tr>`).join("")
+    || `<tr><td colspan="6" style="color:#8b94a7">暂无记录</td></tr>`;
+}
+
+$("start").onclick = run;
+renderHistory();
+drawChart();
+</script>
+</body>
+</html>
